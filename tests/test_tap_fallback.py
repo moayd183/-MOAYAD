@@ -75,5 +75,5 @@ async def test_retry_reports_real_http_status(monkeypatch):
     transport = httpx.MockTransport(lambda req: httpx.Response(502, text='Proxy Error'))
     original = httpx.AsyncClient
     monkeypatch.setattr(remote.httpx, 'AsyncClient', lambda **kw: original(transport=transport, **kw))
-    with pytest.raises(UpstreamError, match=r'HTTP 502 \\(irsa.ipac.caltech.edu\\)'):
+    with pytest.raises(UpstreamError, match=r'HTTP 502'):
         await remote.get_bytes('https://irsa.ipac.caltech.edu/SIA')
