@@ -1,0 +1,10 @@
+{
+  "name": "skyshift-ai",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Framework-free frontend; FastAPI serves built static assets directly",
+  "scripts": {
+    "start": "python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000",
+    "test": "python -m pytest -q"
+  }
+}

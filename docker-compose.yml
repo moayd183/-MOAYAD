@@ -1,0 +1,13 @@
+services:
+  skyshift:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      SKYSHIFT_HTTP_TIMEOUT: ${SKYSHIFT_HTTP_TIMEOUT:-18}
+      SKYSHIFT_MAX_REMOTE_BYTES: ${SKYSHIFT_MAX_REMOTE_BYTES:-45000000}
+    volumes:
+      - skyshift_data:/app/local_data
+    restart: unless-stopped
+volumes:
+  skyshift_data:

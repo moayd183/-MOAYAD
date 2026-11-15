@@ -1,0 +1,1 @@
+"""SkyShift AI application package."""
