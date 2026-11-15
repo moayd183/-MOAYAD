@@ -1,5 +1,8 @@
 """Actual SIA2 discovery, dataset metadata and bounded FITS cutout fetches."""
 from datetime import datetime, timedelta, timezone
+from io import StringIO
+from urllib.parse import urljoin
+import csv
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -107,6 +110,94 @@ def balanced_year_sample(records: list[dict], limit: int) -> list[dict]:
     return sorted(selected, key=lambda o: (o.get('date') or '', o.get('obs_id') or ''))
 
 
+
+# Same NASA/IPAC IRSA archive, different documented interface.
+# These are discovery records, not substitute observation images.
+TAP_ENDPOINT = 'https://irsa.ipac.caltech.edu/TAP/sync'
+
+
+def _tap_datetime(value: str) -> tuple[str | None, float | None]:
+    """Return only an actually reported timestamp and its MJD."""
+    if not value or not value.strip():
+        return None, None
+    raw = value.strip()
+    try:
+        if raw.replace('.', '', 1).isdigit():
+            mjd = float(raw)
+            return (mjd_to_iso(mjd), mjd) if 40000 <= mjd <= 100000 else (None, None)
+        dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        mjd = (dt - datetime(1858, 11, 17, tzinfo=timezone.utc)).total_seconds() / 86400
+        return dt.isoformat().replace('+00:00', 'Z'), mjd
+    except (ValueError, OverflowError):
+        return None, None
+
+
+def _tap_record(row: dict, collection: str) -> dict | None:
+    """Reject non-IRSA URLs, incorrect releases, and unverified survey groups."""
+    relative = (row.get('uri') or '').strip()
+    if (not relative or relative.startswith(('http:', 'https:', '//'))
+            or collection.endswith('_deep')):
+        return None
+    url = urljoin('https://irsa.ipac.caltech.edu/', relative.lstrip('/'))
+    try:
+        validated_url(url, spherex_only=True)
+    except ValueError:
+        return None
+    release = 'dr1' if collection == 'spherex_dr1' else 'qr3'
+    if not urlsplit(url).path.startswith(f'/ibe/data/spherex/{release}/level2/'):
+        return None
+    bandpass = (row.get('energy_bandpassname') or '').strip()
+    match = re.search(r'_2D([1-6])_', urlsplit(url).path, re.IGNORECASE)
+    detector = detector_number(bandpass) or (int(match.group(1)) if match else None)
+    date, t_min = _tap_datetime(row.get('time_bounds_lower') or '')
+    return {
+        'obs_id': Path(urlsplit(url).path).stem,
+        'collection': collection, 'ra': None, 'dec': None,
+        't_min': t_min, 't_max': None, 'date': date,
+        'em_min_m': None, 'em_max_m': None,
+        'detector': detector, 'bandpass': bandpass or None,
+        'access_url': url,
+        'source': 'NASA/IPAC IRSA SPHEREx TAP (SIA fallback)',
+        'data_mode': 'real',
+        'metadata_note': 'TAP: wide/deep classification and wavelength bounds unverified.',
+    }
+
+
+async def search_spherex_tap(ra: float, dec: float, collection: str, max_records: int) -> list[dict]:
+    """Official IRSA TAP artifact/plane spatial metadata fallback (wide only)."""
+    if collection not in ('spherex_dr1', 'spherex_qr3'):
+        raise UpstreamError('TAP fallback unverified for deep-field collection.')
+    release = collection.split('_')[1]
+    query = (
+        f"SELECT TOP {min(500, max(1, max_records) * 3)} a.uri AS uri, "
+        "p.time_bounds_lower AS time_bounds_lower, "
+        "p.energy_bandpassname AS energy_bandpassname "
+        "FROM spherex.artifact a JOIN spherex.plane p ON a.planeid = p.planeid "
+        f"WHERE 1 = CONTAINS(POINT('ICRS', {ra:.9f}, {dec:.9f}), p.poly) "
+        f"AND a.uri LIKE '%/spherex/{release}/level2/%' "
+        "ORDER BY p.time_bounds_lower"
+    )
+    raw = await get_bytes(TAP_ENDPOINT, params={'QUERY': query, 'FORMAT': 'CSV'}, max_bytes=10_000_000)
+    try:
+        reader = csv.DictReader(StringIO(raw.decode('utf-8-sig')))
+        if reader.fieldnames is None:
+            raise ValueError('CSV header missing')
+        reader.fieldnames = [field.strip().lower() for field in reader.fieldnames]
+        if not {'uri', 'time_bounds_lower', 'energy_bandpassname'}.issubset(reader.fieldnames):
+            raise ValueError('CSV columns unexpected')
+        rows = list(reader)
+    except (UnicodeDecodeError, csv.Error, ValueError) as exc:
+        raise UpstreamError('IRSA TAP response cannot be parsed as observation metadata.') from exc
+    results = [_tap_record(row, collection) for row in rows]
+    accepted = [rec for rec in results if rec is not None]
+    if rows and not accepted:
+        raise UpstreamError('IRSA TAP rows had no verified SPHEREx FITS URLs.')
+    return accepted
+
+
 async def search_spherex(payload: SearchRequest) -> dict:
     """Search real archival data and distinguish empty, filtered, unsupported and failed results.
 
@@ -138,6 +229,21 @@ async def search_spherex(payload: SearchRequest) -> dict:
             diagnostics.append({'collection': collection, 'archive_rows': len(rows),
                                 'supported_downloads': accepted, 'unsupported_downloads': len(rows)-accepted})
         except UpstreamError as exc:
+            # TAP is a separate official IRSA metadata service, not simulated images.
+            # Only use it after retryable SIA failures; never hide malformed responses.
+            if 'Astronomy service unavailable after retries:' in str(exc) and not collection.endswith('_deep'):
+                try:
+                    tap_records = await search_spherex_tap(payload.ra, payload.dec, collection, payload.max_records)
+                    results.extend(tap_records)
+                    raw_matched += len(tap_records)
+                    diagnostics.append({'collection': collection, 'source': 'IRSA TAP',
+                                        'sia_error': str(exc), 'supported_downloads': len(tap_records),
+                                        'note': 'TAP metadata fallback; per-record wavelength bounds unverified.'})
+                    continue
+                except UpstreamError as tap_exc:
+                    errors.append({'collection': collection, 'message': str(exc), 'tap_error': str(tap_exc)})
+                    diagnostics.append({'collection': collection, 'sia_error': str(exc), 'tap_error': str(tap_exc)})
+                    continue
             errors.append({'collection': collection, 'message': str(exc)})
             diagnostics.append({'collection': collection, 'error': str(exc)})
     seen, deduped = set(), []
@@ -187,7 +293,7 @@ async def search_spherex(payload: SearchRequest) -> dict:
         'truncated': len(deduped) > len(clipped),
         'collections_checked': payload.collections,
         'data_mode': 'real', 'source': 'NASA/IPAC IRSA SIA2',
-        'source_url': SIA_ENDPOINT, 'errors': errors,
+        'source_url': SIA_ENDPOINT, 'fallback_url': TAP_ENDPOINT, 'errors': errors,
         'status': status, 'message': message, 'diagnostics': diagnostics,
         'archive_rows': raw_matched, 'supported_rows': len(results),
         'unsupported_rows': unsupported, 'filtered_out': filtered_out,

@@ -95,4 +95,12 @@ async def get_bytes(url: str, params: dict | None = None, max_bytes: int = MAX_R
             LOG.warning('Remote astronomy request retry %s: %s', attempt + 1, str(exc)[:160])
             if attempt < 2:
                 await asyncio.sleep(0.3 * (2 ** attempt))
-    raise UpstreamError(f'Astronomy service unavailable after retries: {type(last_error).__name__}')
+    if isinstance(last_error, httpx.HTTPStatusError):
+        detail = f'HTTP {last_error.response.status_code} ({last_error.request.url.host})'
+    elif isinstance(last_error, httpx.TimeoutException):
+        detail = 'network timeout'
+    elif isinstance(last_error, httpx.TransportError):
+        detail = 'network transport error'
+    else:
+        detail = 'unknown connection failure'
+    raise UpstreamError(f'Astronomy service unavailable after retries: {detail}')
